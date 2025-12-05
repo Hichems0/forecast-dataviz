@@ -1,0 +1,7 @@
+# Requirements pour l'application Data Viz
+streamlit
+pandas
+numpy
+plotly
+requests
+openpyxl
