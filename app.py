@@ -685,7 +685,12 @@ if uploaded_file is not None:
 
                         article_df_with_sum = pd.concat([article_df, pd.DataFrame([sum_row])], ignore_index=True)
 
+                        # Nettoyer le nom de feuille (Excel interdit certains caractères)
                         sheet_name = article[:31]  # Excel limit
+                        for char in ['\\', '/', '?', '*', '[', ']', ':']:
+                            sheet_name = sheet_name.replace(char, '_')
+                        sheet_name = sheet_name.strip("'")  # Pas d'apostrophe au début/fin
+
                         article_df_with_sum.to_excel(writer, sheet_name=sheet_name, index=False)
 
                         # Formater dernière ligne
