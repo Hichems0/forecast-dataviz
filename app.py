@@ -1122,10 +1122,17 @@ if uploaded_file is not None:
 
                 if result_val and result_val.get("success"):
                     predictions_val = np.array(result_val["predictions"])
+                    lower_bound_val = np.array(result_val["lower_bound"])
+                    upper_bound_val = np.array(result_val["upper_bound"])
+                    simulated_path_val = np.array(result_val["simulated_path"])
 
                     # Calculer totaux et métriques
                     total_predicted = predictions_val.sum()
                     total_real = true_values.sum()
+                    total_ic_bas = lower_bound_val.sum()
+                    total_ic_haut = upper_bound_val.sum()
+                    total_trajectoire = simulated_path_val.sum()
+
                     mae = np.mean(np.abs(predictions_val - true_values))
                     rmse = np.sqrt(np.mean((predictions_val - true_values) ** 2))
 
@@ -1138,7 +1145,10 @@ if uploaded_file is not None:
 
                     validation_summary.append({
                         "Article": article,
-                        "Total_Prévu": total_predicted,
+                        "Total_Prévision_Moyenne": total_predicted,
+                        "Total_IC_95_Bas": total_ic_bas,
+                        "Total_IC_95_Haut": total_ic_haut,
+                        "Total_Trajectoire_Simulée": total_trajectoire,
                         "Total_Réel": total_real,
                         "Erreur_Absolue": abs(total_predicted - total_real),
                         "Erreur_Relative_%": abs(total_predicted - total_real) / total_real * 100 if total_real != 0 else np.nan,
