@@ -957,11 +957,11 @@ if uploaded_file is not None:
             "Le modèle est entraîné sur une période et prédit sur une autre période dont vous connaissez déjà les résultats."
         )
 
-        # Sélection article
-        st.subheader("🔍 Sélection de l'article")
+        # Sélection articles multiples
+        st.subheader("🔍 Sélection des articles")
 
         search_text_val = st.text_input(
-            "🔎 Rechercher un article :",
+            "🔎 Rechercher des articles :",
             value="",
             placeholder="Ex : VIVA, LINDT, PATES...",
             key="search_validation"
@@ -976,11 +976,18 @@ if uploaded_file is not None:
             st.warning("Aucun article ne correspond à votre recherche.")
             st.stop()
 
-        selected_article_val = st.selectbox(
-            "📦 Article :",
+        selected_articles_val = st.multiselect(
+            "📦 Sélectionnez un ou plusieurs articles :",
             filtered_articles_val,
-            key="article_validation"
+            default=[],
+            key="articles_validation"
         )
+
+        if not selected_articles_val:
+            st.info("👆 Sélectionnez au moins un article pour commencer")
+            st.stop()
+
+        st.write(f"**{len(selected_articles_val)}** article(s) sélectionné(s)")
 
         # Fréquence
         freq_label_val = st.radio(
@@ -997,27 +1004,19 @@ if uploaded_file is not None:
         else:
             freq_val = "M"
 
-        # Préparer les données de l'article
+        # Obtenir les dates globales pour tous les articles sélectionnés
         df_agg_val = aggregate_quantities(df_daily, freq=freq_val)
-        df_article_val = df_agg_val[df_agg_val["Description article"] == selected_article_val].copy()
-        df_article_val = df_article_val.sort_values("Période")
+        df_selected_val = df_agg_val[df_agg_val["Description article"].isin(selected_articles_val)].copy()
 
-        # Trimming
-        nonzero_mask_val = df_article_val["Quantité_totale"] != 0
-        if nonzero_mask_val.any():
-            first_idx_val = df_article_val.index[nonzero_mask_val][0]
-            last_idx_val = df_article_val.index[nonzero_mask_val][-1]
-            df_article_val = df_article_val.loc[first_idx_val:last_idx_val]
-
-        if df_article_val.empty:
-            st.warning("Aucune donnée disponible pour cet article.")
+        if df_selected_val.empty:
+            st.warning("Aucune donnée disponible pour les articles sélectionnés.")
             st.stop()
 
         # Sélection des périodes train/test
         st.subheader("📅 Définition des périodes")
 
-        min_date_val = df_article_val["Période"].min().date()
-        max_date_val = df_article_val["Période"].max().date()
+        min_date_val = df_selected_val["Période"].min().date()
+        max_date_val = df_selected_val["Période"].max().date()
 
         col_train_start, col_train_end = st.columns(2)
         with col_train_start:
@@ -1055,154 +1054,161 @@ if uploaded_file is not None:
                 key="test_end"
             )
 
-        # Filtrer données train et test
-        mask_train = (
-            (df_article_val["Période"] >= pd.to_datetime(train_start_date)) &
-            (df_article_val["Période"] <= pd.to_datetime(train_end_date))
-        )
-        df_train = df_article_val.loc[mask_train].copy()
-
-        mask_test = (
-            (df_article_val["Période"] >= pd.to_datetime(test_start_date)) &
-            (df_article_val["Période"] <= pd.to_datetime(test_end_date))
-        )
-        df_test = df_article_val.loc[mask_test].copy()
-
-        # Vérifications
-        if df_train.empty:
-            st.error("❌ La période d'entraînement ne contient aucune donnée.")
-            st.stop()
-
-        if df_test.empty:
-            st.error("❌ La période de test ne contient aucune donnée.")
-            st.stop()
-
-        st.info(f"📊 Période d'entraînement : {len(df_train)} points | Période de test : {len(df_test)} points")
-
         # Bouton validation
-        run_validation = st.button("🚀 Lancer la validation", key="run_validation", type="primary")
+        run_validation = st.button("🚀 Lancer la validation batch", key="run_validation", type="primary")
 
         if run_validation:
-            with st.spinner("⏳ Validation en cours..."):
-                # Préparer les données d'entraînement
+            st.info(f"🔄 Validation de {len(selected_articles_val)} article(s)...")
+
+            # Initialiser stockage
+            st.session_state.validation_results = []
+            st.session_state.validation_config = {
+                'train_start': train_start_date,
+                'train_end': train_end_date,
+                'test_start': test_start_date,
+                'test_end': test_end_date,
+                'freq': freq_val
+            }
+
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+
+            validation_summary = []
+
+            for idx, article in enumerate(selected_articles_val):
+                status_text.text(f"⏳ Validation de {article} ({idx+1}/{len(selected_articles_val)})...")
+
+                # Préparer données pour cet article
+                df_article_val = df_agg_val[df_agg_val["Description article"] == article].copy()
+                df_article_val = df_article_val.sort_values("Période")
+
+                # Trimming
+                nonzero_mask_val = df_article_val["Quantité_totale"] != 0
+                if nonzero_mask_val.any():
+                    first_idx_val = df_article_val.index[nonzero_mask_val][0]
+                    last_idx_val = df_article_val.index[nonzero_mask_val][-1]
+                    df_article_val = df_article_val.loc[first_idx_val:last_idx_val]
+
+                # Filtrer train
+                mask_train = (
+                    (df_article_val["Période"] >= pd.to_datetime(train_start_date)) &
+                    (df_article_val["Période"] <= pd.to_datetime(train_end_date))
+                )
+                df_train = df_article_val.loc[mask_train].copy()
+
+                # Filtrer test
+                mask_test = (
+                    (df_article_val["Période"] >= pd.to_datetime(test_start_date)) &
+                    (df_article_val["Période"] <= pd.to_datetime(test_end_date))
+                )
+                df_test = df_article_val.loc[mask_test].copy()
+
+                if df_train.empty or df_test.empty:
+                    st.warning(f"⚠️ Pas assez de données pour {article}, ignoré.")
+                    continue
+
+                # Préparer séries
                 series_train = df_train.set_index("Période")["Quantité_totale"]
+                true_values = df_test.set_index("Période")["Quantité_totale"].values
                 horizon_val = len(df_test)
 
-                # Appel API avec données train uniquement
+                # Appel API
                 result_val = call_modal_api(
                     series_data=series_train.values,
                     horizon=horizon_val,
                     dates=series_train.index,
-                    product_name=selected_article_val
+                    product_name=article
                 )
 
-                # Stocker dans session_state
-                st.session_state.validation_result = {
-                    'result': result_val,
-                    'series_train': series_train,
-                    'df_test': df_test,
-                    'horizon': horizon_val,
-                    'selected_article': selected_article_val
-                }
+                if result_val and result_val.get("success"):
+                    predictions_val = np.array(result_val["predictions"])
+
+                    # Calculer totaux et métriques
+                    total_predicted = predictions_val.sum()
+                    total_real = true_values.sum()
+                    mae = np.mean(np.abs(predictions_val - true_values))
+                    rmse = np.sqrt(np.mean((predictions_val - true_values) ** 2))
+
+                    # MAPE
+                    mask_nonzero = true_values != 0
+                    if mask_nonzero.any():
+                        mape = np.mean(np.abs((true_values[mask_nonzero] - predictions_val[mask_nonzero]) / true_values[mask_nonzero])) * 100
+                    else:
+                        mape = np.nan
+
+                    validation_summary.append({
+                        "Article": article,
+                        "Total_Prévu": total_predicted,
+                        "Total_Réel": total_real,
+                        "Erreur_Absolue": abs(total_predicted - total_real),
+                        "Erreur_Relative_%": abs(total_predicted - total_real) / total_real * 100 if total_real != 0 else np.nan,
+                        "MAE": mae,
+                        "RMSE": rmse,
+                        "MAPE_%": mape,
+                        "Modèle": result_val["model_used"],
+                        "Points_Train": len(series_train),
+                        "Points_Test": len(df_test)
+                    })
+                else:
+                    st.warning(f"⚠️ Échec pour {article}")
+
+                progress_bar.progress((idx + 1) / len(selected_articles_val))
+
+            # Stocker résultats
+            st.session_state.validation_results = validation_summary
+
+            status_text.text("✅ Validation terminée !")
+            st.success(f"✅ Validation réussie pour {len(validation_summary)}/{len(selected_articles_val)} article(s)")
 
         # Afficher résultats depuis session_state
-        if 'validation_result' in st.session_state:
-            stored_val = st.session_state.validation_result
-            result_val = stored_val['result']
-            series_train = stored_val['series_train']
-            df_test = stored_val['df_test']
-            horizon_val = stored_val['horizon']
-            selected_article_val = stored_val['selected_article']
+        if 'validation_results' in st.session_state and len(st.session_state.validation_results) > 0:
+            validation_summary = st.session_state.validation_results
+            validation_df = pd.DataFrame(validation_summary)
 
-            if result_val and result_val.get("success"):
-                st.success(f"✅ Validation réussie avec le modèle : **{result_val['model_used']}**")
+            st.subheader("📊 Résultats de la validation")
 
-                # Récupérer les prédictions
-                predictions_val = np.array(result_val["predictions"])
-                lower_bound_val = np.array(result_val["lower_bound"])
-                upper_bound_val = np.array(result_val["upper_bound"])
-                simulated_path_val = np.array(result_val["simulated_path"])
-
-                # Vraies valeurs
-                true_values = df_test.set_index("Période")["Quantité_totale"].values
-
-                # Calculer métriques d'erreur
-                mae = np.mean(np.abs(predictions_val - true_values))
-                rmse = np.sqrt(np.mean((predictions_val - true_values) ** 2))
-
-                # MAPE (éviter division par zéro)
-                mask_nonzero = true_values != 0
-                if mask_nonzero.any():
-                    mape = np.mean(np.abs((true_values[mask_nonzero] - predictions_val[mask_nonzero]) / true_values[mask_nonzero])) * 100
+            # Afficher métriques globales
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                avg_mae = validation_df["MAE"].mean()
+                st.metric("MAE Moyenne", f"{avg_mae:.2f}")
+            with col2:
+                avg_rmse = validation_df["RMSE"].mean()
+                st.metric("RMSE Moyenne", f"{avg_rmse:.2f}")
+            with col3:
+                avg_mape = validation_df["MAPE_%"].mean()
+                if not np.isnan(avg_mape):
+                    st.metric("MAPE Moyenne", f"{avg_mape:.2f}%")
                 else:
-                    mape = np.nan
+                    st.metric("MAPE Moyenne", "N/A")
 
-                # Afficher métriques
-                st.subheader("📈 Métriques de performance")
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("MAE (Erreur Absolue Moyenne)", f"{mae:.2f}")
-                with col2:
-                    st.metric("RMSE (Erreur Quadratique)", f"{rmse:.2f}")
-                with col3:
-                    if not np.isnan(mape):
-                        st.metric("MAPE (Erreur % Moyenne)", f"{mape:.2f}%")
-                    else:
-                        st.metric("MAPE", "N/A")
+            # Afficher tableau synthétique
+            st.subheader("📋 Tableau synthétique par article")
+            st.dataframe(validation_df, use_container_width=True)
 
-                # Créer DataFrame pour export
-                forecast_val_df = pd.DataFrame({
-                    "Date": df_test["Période"].values,
-                    "Prévision_moyenne": predictions_val,
-                    "IC_95_bas": lower_bound_val,
-                    "IC_95_haut": upper_bound_val,
-                    "Trajectoire_simulée": simulated_path_val,
-                    "Valeurs_réelles": true_values,
-                    "Erreur_absolue": np.abs(predictions_val - true_values),
-                    "Erreur_relative_%": np.where(true_values != 0,
-                                                   np.abs(predictions_val - true_values) / true_values * 100,
-                                                   np.nan)
-                })
+            # Export Excel
+            st.subheader("📥 Téléchargement")
 
-                if result_val.get("median_predictions"):
-                    forecast_val_df["Prévision_médiane"] = result_val["median_predictions"]
+            validation_buffer = io.BytesIO()
+            with pd.ExcelWriter(validation_buffer, engine='openpyxl') as writer:
+                # UNE SEULE feuille avec le tableau synthétique
+                validation_df.to_excel(writer, sheet_name="Validation_Synthèse", index=False)
 
-                # Afficher tableau
-                st.subheader("📊 Comparaison Prévisions vs Réalité")
-                st.dataframe(forecast_val_df, use_container_width=True)
+                # Formater les nombres
+                from openpyxl.styles import Font
+                worksheet = writer.sheets["Validation_Synthèse"]
 
-                # Export Excel
-                st.subheader("📥 Téléchargement")
+                # En-têtes en gras
+                for cell in worksheet[1]:
+                    cell.font = Font(bold=True)
 
-                validation_buffer = io.BytesIO()
-                with pd.ExcelWriter(validation_buffer, engine='openpyxl') as writer:
-                    # Feuille principale
-                    forecast_val_df.to_excel(writer, sheet_name="Validation", index=False)
+            validation_buffer.seek(0)
 
-                    # Feuille métriques
-                    metrics_df = pd.DataFrame({
-                        "Métrique": ["MAE", "RMSE", "MAPE (%)", "Modèle utilisé", "Points train", "Points test"],
-                        "Valeur": [
-                            f"{mae:.2f}",
-                            f"{rmse:.2f}",
-                            f"{mape:.2f}" if not np.isnan(mape) else "N/A",
-                            result_val['model_used'],
-                            len(series_train),
-                            len(df_test)
-                        ]
-                    })
-                    metrics_df.to_excel(writer, sheet_name="Métriques", index=False)
-
-                validation_buffer.seek(0)
-
-                timestamp_val = datetime.now().strftime("%Y%m%d_%H%M%S")
-                st.download_button(
-                    label=f"📥 Télécharger validation {selected_article_val}",
-                    data=validation_buffer,
-                    file_name=f"validation_{selected_article_val}_{timestamp_val}.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="download_validation"
-                )
-
-            elif result_val:
-                st.error(f"❌ Erreur lors de la validation : {result_val.get('error', 'Erreur inconnue')}")
+            timestamp_val = datetime.now().strftime("%Y%m%d_%H%M%S")
+            st.download_button(
+                label=f"📥 Télécharger validation ({len(validation_summary)} articles)",
+                data=validation_buffer,
+                file_name=f"validation_batch_{timestamp_val}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_validation"
+            )
