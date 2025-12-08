@@ -557,6 +557,38 @@ if uploaded_file is not None:
                 key="horizon_batch"
             )
 
+        # Sélection de plage de dates pour le batch
+        st.subheader("📅 Plage de dates pour l'historique")
+
+        # Obtenir min/max dates globales
+        if len(selected_articles) > 0:
+            temp_freq = "D" if batch_freq == "Jour" else ("W-MON" if batch_freq == "Semaine" else "M")
+            df_temp = aggregate_quantities(df_daily, freq=temp_freq)
+            all_dates = df_temp["Période"].unique()
+            global_min_date = pd.to_datetime(all_dates).min().date()
+            global_max_date = pd.to_datetime(all_dates).max().date()
+        else:
+            global_min_date = df_daily["Date de livraison"].min().date()
+            global_max_date = df_daily["Date de livraison"].max().date()
+
+        col_batch_start, col_batch_end = st.columns(2)
+        with col_batch_start:
+            batch_start_date = st.date_input(
+                "📅 Date de début",
+                value=global_min_date,
+                min_value=global_min_date,
+                max_value=global_max_date,
+                key="batch_start_date"
+            )
+        with col_batch_end:
+            batch_end_date = st.date_input(
+                "📅 Date de fin",
+                value=global_max_date,
+                min_value=batch_start_date,
+                max_value=global_max_date,
+                key="batch_end_date"
+            )
+
         if batch_freq == "Jour":
             freq_batch_val = "D"
         elif batch_freq == "Semaine":
@@ -583,7 +615,9 @@ if uploaded_file is not None:
             st.session_state.all_forecasts = []  # Reset
             st.session_state.batch_config = {
                 'freq': freq_batch_val,
-                'horizon': horizon_batch_val
+                'horizon': horizon_batch_val,
+                'start_date': batch_start_date,
+                'end_date': batch_end_date
             }
 
             progress_bar = st.progress(0)
@@ -605,6 +639,13 @@ if uploaded_file is not None:
                     first_idx = df_art.index[nonzero_mask][0]
                     last_idx = df_art.index[nonzero_mask][-1]
                     df_art = df_art.loc[first_idx:last_idx]
+
+                # Apply date range filter
+                mask_batch_window = (
+                    (df_art["Période"] >= pd.to_datetime(batch_start_date)) &
+                    (df_art["Période"] <= pd.to_datetime(batch_end_date))
+                )
+                df_art = df_art.loc[mask_batch_window].copy()
 
                 if df_art.empty:
                     st.warning(f"⚠️ Pas de données pour {article}, ignoré.")
@@ -870,6 +911,22 @@ if uploaded_file is not None:
 
                     # Feuille de synthèse
                     summary_df.to_excel(writer, sheet_name="Synthèse", index=False)
+
+                    # Feuille des totaux par produit
+                    product_totals = []
+                    for article in combined_df["Article"].unique():
+                        article_data = combined_df[combined_df["Article"] == article]
+                        product_totals.append({
+                            "Article": article,
+                            "Total_Prévision_Moyenne": article_data["Prévision_moyenne"].sum(),
+                            "Total_IC_95_Bas": article_data["IC_95_bas"].sum(),
+                            "Total_IC_95_Haut": article_data["IC_95_haut"].sum(),
+                            "Total_Trajectoire_Simulée": article_data["Trajectoire_simulée"].sum(),
+                            "Modèle": article_data["Modèle"].iloc[0] if len(article_data) > 0 else ""
+                        })
+
+                    totals_df = pd.DataFrame(product_totals)
+                    totals_df.to_excel(writer, sheet_name="Totaux_par_Produit", index=False)
 
                 batch_buffer.seek(0)
 
