@@ -1,5 +1,5 @@
 """
-Streamlit Data Viz App - Version API
+Streamlit Data Viz App - Version API avec Batch Forecast
 Visualisation avancée avec appel à l'API Modal pour les prévisions
 """
 from __future__ import annotations
@@ -13,6 +13,7 @@ import streamlit as st
 import pandas as pd
 import tempfile
 import os
+from datetime import datetime
 
 # Configuration
 IS_STREAMLIT_CLOUD = os.getenv("STREAMLIT_RUNTIME_ENV") == "cloud" or not os.path.exists("/home")
@@ -113,9 +114,39 @@ def call_modal_api(series_data, horizon, dates=None, product_name="Unknown"):
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
-        st.error(f"❌ Erreur API : {str(e)}")
-        logger.error(f"API Error: {e}")
-        return None
+        logger.error(f"API Error for {product_name}: {e}")
+        return {"success": False, "error": str(e)}
+
+
+def create_forecast_excel_with_sum(forecast_df, product_name):
+    """Crée un fichier Excel avec ligne de somme."""
+    # Ajouter ligne de somme
+    sum_row = {}
+    for col in forecast_df.columns:
+        if col == "Date":
+            sum_row[col] = "TOTAL"
+        elif pd.api.types.is_numeric_dtype(forecast_df[col]):
+            sum_row[col] = forecast_df[col].sum()
+        else:
+            sum_row[col] = ""
+
+    df_with_sum = pd.concat([forecast_df, pd.DataFrame([sum_row])], ignore_index=True)
+
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+        df_with_sum.to_excel(writer, sheet_name="Prévisions", index=False)
+
+        # Formater la dernière ligne (somme) en gras
+        workbook = writer.book
+        worksheet = writer.sheets["Prévisions"]
+
+        from openpyxl.styles import Font
+        last_row = len(df_with_sum) + 1
+        for cell in worksheet[last_row]:
+            cell.font = Font(bold=True)
+
+    buffer.seek(0)
+    return buffer
 
 
 # =========================
@@ -140,8 +171,9 @@ if uploaded_file is not None:
         df_raw = pd.read_excel(uploaded_file)
 
     st.success("✅ Fichier chargé avec succès")
-    st.write("Aperçu des premières lignes :")
-    st.dataframe(df_raw.head())
+
+    with st.expander("📋 Aperçu des données brutes"):
+        st.dataframe(df_raw.head(10), use_container_width=True)
 
     # Préparation du DataFrame journalier
     df_daily = prepare_daily_df(df_raw)
@@ -164,303 +196,519 @@ if uploaded_file is not None:
     st.dataframe(ranking, use_container_width=True)
 
     # ==========
-    # Visualisation détaillée
+    # ONGLETS : Article Unique vs Batch
     # ==========
-    st.subheader("🔍 Visualisation détaillée par article")
+    tab1, tab2 = st.tabs(["📦 Prévision Article Unique", "🚀 Prévision Batch (Multiples Articles)"])
 
-    articles_sorted = ranking["Description article"].tolist()
+    # ========================================
+    # TAB 1 : ARTICLE UNIQUE
+    # ========================================
+    with tab1:
+        st.subheader("🔍 Visualisation détaillée par article")
 
-    # Recherche
-    search_text = st.text_input(
-        "🔎 Rechercher un article :",
-        value="",
-        placeholder="Ex : VIVA, LINDT, PATES..."
-    )
+        articles_sorted = ranking["Description article"].tolist()
 
-    if search_text:
-        filtered_articles = [a for a in articles_sorted if search_text.lower() in a.lower()]
-    else:
-        filtered_articles = articles_sorted
-
-    if not filtered_articles:
-        st.warning("Aucun article ne correspond à votre recherche.")
-        st.stop()
-
-    selected_article = st.selectbox("📦 Article :", filtered_articles)
-
-    freq_label = st.radio("📅 Fréquence d'agrégation :", ("Jour", "Semaine", "Mois"), horizontal=True)
-
-    if freq_label == "Jour":
-        freq = "D"
-    elif freq_label == "Semaine":
-        freq = "W-MON"
-    else:
-        freq = "M"
-
-    df_agg = aggregate_quantities(df_daily, freq=freq)
-    df_article = df_agg[df_agg["Description article"] == selected_article].copy()
-    df_article = df_article.sort_values("Période")
-
-    # Trimming des dates avec zéros
-    nonzero_mask = df_article["Quantité_totale"] != 0
-    if nonzero_mask.any():
-        first_idx = df_article.index[nonzero_mask][0]
-        last_idx = df_article.index[nonzero_mask][-1]
-        df_article = df_article.loc[first_idx:last_idx]
-
-    # Sélection de fenêtre temporelle
-    if not df_article.empty:
-        min_date = df_article["Période"].min().date()
-        max_date = df_article["Période"].max().date()
-
-        col_start, col_end = st.columns(2)
-        with col_start:
-            start_date = st.date_input("📅 Date de début", value=min_date, min_value=min_date, max_value=max_date)
-        with col_end:
-            end_date = st.date_input("📅 Date de fin", value=max_date, min_value=start_date, max_value=max_date)
-
-        mask_window = (
-            (df_article["Période"] >= pd.to_datetime(start_date)) &
-            (df_article["Période"] <= pd.to_datetime(end_date))
+        # Recherche
+        search_text = st.text_input(
+            "🔎 Rechercher un article :",
+            value="",
+            placeholder="Ex : VIVA, LINDT, PATES...",
+            key="search_single"
         )
-        df_article = df_article.loc[mask_window].copy()
 
-        if df_article.empty:
-            st.warning("La fenêtre de dates choisie ne contient aucune donnée.")
+        if search_text:
+            filtered_articles = [a for a in articles_sorted if search_text.lower() in a.lower()]
+        else:
+            filtered_articles = articles_sorted
+
+        if not filtered_articles:
+            st.warning("Aucun article ne correspond à votre recherche.")
             st.stop()
-    else:
-        st.warning("Aucune donnée non nulle pour cet article.")
-        st.stop()
 
-    st.write(f"📦 Article sélectionné : **{selected_article}**")
-    st.write(f"📊 Points de données : {len(df_article)}")
+        selected_article = st.selectbox("📦 Article :", filtered_articles, key="select_single")
 
-    st.dataframe(df_article, use_container_width=True)
+        freq_label = st.radio("📅 Fréquence d'agrégation :", ("Jour", "Semaine", "Mois"), horizontal=True, key="freq_single")
 
-    # ==========
-    # Graphique historique
-    # ==========
-    st.subheader("📈 Historique des quantités")
+        if freq_label == "Jour":
+            freq = "D"
+        elif freq_label == "Semaine":
+            freq = "W-MON"
+        else:
+            freq = "M"
 
-    series_hist = df_article.set_index("Période")["Quantité_totale"]
+        df_agg = aggregate_quantities(df_daily, freq=freq)
+        df_article = df_agg[df_agg["Description article"] == selected_article].copy()
+        df_article = df_article.sort_values("Période")
 
-    fig_hist = go.Figure()
-    fig_hist.add_trace(
-        go.Scatter(
-            x=series_hist.index,
-            y=series_hist.values,
-            mode="lines",
-            name="Historique",
-            line=dict(color="black", width=1.5),
+        # Trimming des dates avec zéros
+        nonzero_mask = df_article["Quantité_totale"] != 0
+        if nonzero_mask.any():
+            first_idx = df_article.index[nonzero_mask][0]
+            last_idx = df_article.index[nonzero_mask][-1]
+            df_article = df_article.loc[first_idx:last_idx]
+
+        # Sélection de fenêtre temporelle
+        if not df_article.empty:
+            min_date = df_article["Période"].min().date()
+            max_date = df_article["Période"].max().date()
+
+            col_start, col_end = st.columns(2)
+            with col_start:
+                start_date = st.date_input("📅 Date de début", value=min_date, min_value=min_date, max_value=max_date, key="start_single")
+            with col_end:
+                end_date = st.date_input("📅 Date de fin", value=max_date, min_value=start_date, max_value=max_date, key="end_single")
+
+            mask_window = (
+                (df_article["Période"] >= pd.to_datetime(start_date)) &
+                (df_article["Période"] <= pd.to_datetime(end_date))
+            )
+            df_article = df_article.loc[mask_window].copy()
+
+            if df_article.empty:
+                st.warning("La fenêtre de dates choisie ne contient aucune donnée.")
+                st.stop()
+        else:
+            st.warning("Aucune donnée non nulle pour cet article.")
+            st.stop()
+
+        st.write(f"📦 Article sélectionné : **{selected_article}**")
+        st.write(f"📊 Points de données : {len(df_article)}")
+
+        st.dataframe(df_article, use_container_width=True)
+
+        # Graphique historique
+        st.subheader("📈 Historique des quantités")
+
+        series_hist = df_article.set_index("Période")["Quantité_totale"]
+
+        fig_hist = go.Figure()
+        fig_hist.add_trace(
+            go.Scatter(
+                x=series_hist.index,
+                y=series_hist.values,
+                mode="lines",
+                name="Historique",
+                line=dict(color="black", width=1.5),
+            )
         )
-    )
 
-    fig_hist.update_layout(
-        template="plotly_white",
-        height=400,
-        margin=dict(l=40, r=20, t=40, b=40),
-        xaxis_title="Date",
-        yaxis_title="Quantité",
-        legend=dict(x=0.01, y=0.99),
-    )
+        fig_hist.update_layout(
+            template="plotly_white",
+            height=400,
+            margin=dict(l=40, r=20, t=40, b=40),
+            xaxis_title="Date",
+            yaxis_title="Quantité",
+            legend=dict(x=0.01, y=0.99),
+        )
 
-    st.plotly_chart(fig_hist, use_container_width=True)
+        st.plotly_chart(fig_hist, use_container_width=True)
 
-    # Export Excel historique
-    hist_buffer = io.BytesIO()
-    series_hist.to_frame(name="Quantité_totale").to_excel(hist_buffer, sheet_name="Historique")
-    hist_buffer.seek(0)
+        # Export Excel historique avec somme
+        hist_df = series_hist.to_frame(name="Quantité_totale").reset_index()
+        hist_buffer = create_forecast_excel_with_sum(hist_df, selected_article)
 
-    st.download_button(
-        label="📥 Télécharger l'historique (Excel)",
-        data=hist_buffer,
-        file_name=f"historique_{selected_article}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+        st.download_button(
+            label="📥 Télécharger l'historique (Excel avec TOTAL)",
+            data=hist_buffer,
+            file_name=f"historique_{selected_article}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_hist"
+        )
 
-    # ==========
-    # Prévision IA via API Modal
-    # ==========
-    st.subheader("🤖 Prévision IA (via API Modal)")
+        # Prévision IA
+        st.subheader("🤖 Prévision IA (via API Modal)")
 
-    horizon_choice = st.selectbox(
-        "Horizon de prévision :",
-        ["Aucune", "7 jours", "30 jours", "60 jours", "90 jours"],
-        index=0,
-    )
+        horizon_choice = st.selectbox(
+            "Horizon de prévision :",
+            ["Aucune", "7 jours", "30 jours", "60 jours", "90 jours"],
+            index=0,
+            key="horizon_single"
+        )
 
-    if horizon_choice == "Aucune":
-        forecast_horizon = None
-    elif horizon_choice == "7 jours":
-        forecast_horizon = 7
-    elif horizon_choice == "30 jours":
-        forecast_horizon = 30
-    elif horizon_choice == "60 jours":
-        forecast_horizon = 60
-    else:
-        forecast_horizon = 90
+        if horizon_choice == "Aucune":
+            forecast_horizon = None
+        elif horizon_choice == "7 jours":
+            forecast_horizon = 7
+        elif horizon_choice == "30 jours":
+            forecast_horizon = 30
+        elif horizon_choice == "60 jours":
+            forecast_horizon = 60
+        else:
+            forecast_horizon = 90
 
-    run_forecast = st.button("🚀 Lancer la prévision IA")
+        run_forecast = st.button("🚀 Lancer la prévision IA", key="run_single")
 
-    if forecast_horizon is not None and run_forecast:
-        with st.spinner("⏳ Appel de l'API Modal en cours..."):
-            result = call_modal_api(
-                series_data=series_hist.values,
-                horizon=forecast_horizon,
-                dates=series_hist.index,
-                product_name=selected_article
-            )
-
-        if result and result.get("success"):
-            st.success(f"✅ Prévision réussie avec le modèle : **{result['model_used']}**")
-
-            # Affichage diagnostics
-            st.caption("📊 Diagnostics du routage intelligent :")
-            routing_info = result.get("routing_info", {})
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Ratio de zéros", f"{routing_info.get('zero_ratio', 0)*100:.1f}%")
-            with col2:
-                st.metric("Dispersion", f"{routing_info.get('dispersion', 0):.3f}")
-            with col3:
-                st.metric("Autocorrélation", f"{routing_info.get('acf_lag1', 0):.3f}")
-
-            # Construction de l'index futur
-            if isinstance(series_hist.index, pd.DatetimeIndex):
-                inferred_freq = pd.infer_freq(series_hist.index)
-                if inferred_freq is None:
-                    inferred_freq = "D"
-                start_future = series_hist.index[-1] + pd.tseries.frequencies.to_offset(inferred_freq)
-                future_index = pd.date_range(start=start_future, periods=forecast_horizon, freq=inferred_freq)
-            else:
-                last_idx = series_hist.index[-1]
-                future_index = np.arange(last_idx + 1, last_idx + 1 + forecast_horizon)
-
-            # Extraction des résultats
-            predictions = np.array(result["predictions"])
-            lower_bound = np.array(result["lower_bound"])
-            upper_bound = np.array(result["upper_bound"])
-            simulated_path = np.array(result["simulated_path"])
-            median_predictions = result.get("median_predictions")
-
-            # Graphique historique + prévisions
-            st.subheader("📊 Historique et prévisions")
-
-            fig_pred = go.Figure()
-
-            # Historique
-            fig_pred.add_trace(
-                go.Scatter(
-                    x=series_hist.index,
-                    y=series_hist.values,
-                    mode="lines",
-                    name="Historique",
-                    line=dict(color="black", width=1.5),
+        if forecast_horizon is not None and run_forecast:
+            with st.spinner("⏳ Appel de l'API Modal en cours..."):
+                result = call_modal_api(
+                    series_data=series_hist.values,
+                    horizon=forecast_horizon,
+                    dates=series_hist.index,
+                    product_name=selected_article
                 )
-            )
 
-            # Prévision moyenne
-            fig_pred.add_trace(
-                go.Scatter(
-                    x=future_index,
-                    y=predictions,
-                    mode="lines",
-                    name="Prévision (moyenne)",
-                    line=dict(color="blue", width=2),
-                )
-            )
+            if result and result.get("success"):
+                st.success(f"✅ Prévision réussie avec le modèle : **{result['model_used']}**")
 
-            # Intervalle de confiance
-            fig_pred.add_trace(
-                go.Scatter(
-                    x=future_index,
-                    y=upper_bound,
-                    mode="lines",
-                    name="IC 95% (haut)",
-                    line=dict(color="rgba(0,100,255,0.3)", width=1, dash="dot"),
-                    showlegend=False,
-                )
-            )
+                # Affichage diagnostics
+                st.caption("📊 Diagnostics du routage intelligent :")
+                routing_info = result.get("routing_info", {})
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Ratio de zéros", f"{routing_info.get('zero_ratio', 0)*100:.1f}%")
+                with col2:
+                    st.metric("Dispersion", f"{routing_info.get('dispersion', 0):.3f}")
+                with col3:
+                    st.metric("Autocorrélation", f"{routing_info.get('acf_lag1', 0):.3f}")
 
-            fig_pred.add_trace(
-                go.Scatter(
-                    x=future_index,
-                    y=lower_bound,
-                    mode="lines",
-                    name="IC 95%",
-                    line=dict(color="rgba(0,100,255,0.3)", width=1, dash="dot"),
-                    fill="tonexty",
-                    fillcolor="rgba(0,100,255,0.2)",
-                )
-            )
+                # Construction de l'index futur
+                if isinstance(series_hist.index, pd.DatetimeIndex):
+                    inferred_freq = pd.infer_freq(series_hist.index)
+                    if inferred_freq is None:
+                        inferred_freq = "D"
+                    start_future = series_hist.index[-1] + pd.tseries.frequencies.to_offset(inferred_freq)
+                    future_index = pd.date_range(start=start_future, periods=forecast_horizon, freq=inferred_freq)
+                else:
+                    last_idx = series_hist.index[-1]
+                    future_index = np.arange(last_idx + 1, last_idx + 1 + forecast_horizon)
 
-            # Médiane si disponible
-            if median_predictions is not None:
+                # Extraction des résultats
+                predictions = np.array(result["predictions"])
+                lower_bound = np.array(result["lower_bound"])
+                upper_bound = np.array(result["upper_bound"])
+                simulated_path = np.array(result["simulated_path"])
+                median_predictions = result.get("median_predictions")
+
+                # Graphique historique + prévisions
+                st.subheader("📊 Historique et prévisions")
+
+                fig_pred = go.Figure()
+
+                # Historique
                 fig_pred.add_trace(
                     go.Scatter(
-                        x=future_index,
-                        y=median_predictions,
+                        x=series_hist.index,
+                        y=series_hist.values,
                         mode="lines",
-                        name="Prévision (médiane)",
-                        line=dict(color="green", width=2, dash="dash"),
+                        name="Historique",
+                        line=dict(color="black", width=1.5),
                     )
                 )
 
-            # Trajectoire simulée
-            if result["model_used"] == "BayesianLSTM":
-                label = "Trajectoire simulée (MC Dropout)"
-                color = "rgba(124, 252, 0, 0.9)"
-            elif result["model_used"] == "SparseSpikeForecaster":
-                label = "Pics périodiques simulés"
-                color = "rgba(255, 165, 0, 0.9)"
-            else:
-                label = "Scénario simulé 0/spikes"
-                color = "rgba(255, 0, 0, 0.9)"
-
-            fig_pred.add_trace(
-                go.Scatter(
-                    x=future_index,
-                    y=simulated_path,
-                    mode="markers+lines",
-                    name=label,
-                    line=dict(color=color, width=1.5),
-                    marker=dict(size=6),
+                # Prévision moyenne
+                fig_pred.add_trace(
+                    go.Scatter(
+                        x=future_index,
+                        y=predictions,
+                        mode="lines",
+                        name="Prévision (moyenne)",
+                        line=dict(color="blue", width=2),
+                    )
                 )
+
+                # Intervalle de confiance
+                fig_pred.add_trace(
+                    go.Scatter(
+                        x=future_index,
+                        y=upper_bound,
+                        mode="lines",
+                        name="IC 95% (haut)",
+                        line=dict(color="rgba(0,100,255,0.3)", width=1, dash="dot"),
+                        showlegend=False,
+                    )
+                )
+
+                fig_pred.add_trace(
+                    go.Scatter(
+                        x=future_index,
+                        y=lower_bound,
+                        mode="lines",
+                        name="IC 95%",
+                        line=dict(color="rgba(0,100,255,0.3)", width=1, dash="dot"),
+                        fill="tonexty",
+                        fillcolor="rgba(0,100,255,0.2)",
+                    )
+                )
+
+                # Médiane si disponible
+                if median_predictions is not None:
+                    fig_pred.add_trace(
+                        go.Scatter(
+                            x=future_index,
+                            y=median_predictions,
+                            mode="lines",
+                            name="Prévision (médiane)",
+                            line=dict(color="green", width=2, dash="dash"),
+                        )
+                    )
+
+                # Trajectoire simulée
+                if result["model_used"] == "BayesianLSTM":
+                    label = "Trajectoire simulée (MC Dropout)"
+                    color = "rgba(124, 252, 0, 0.9)"
+                elif result["model_used"] == "SparseSpikeForecaster":
+                    label = "Pics périodiques simulés"
+                    color = "rgba(255, 165, 0, 0.9)"
+                else:
+                    label = "Scénario simulé 0/spikes"
+                    color = "rgba(255, 0, 0, 0.9)"
+
+                fig_pred.add_trace(
+                    go.Scatter(
+                        x=future_index,
+                        y=simulated_path,
+                        mode="markers+lines",
+                        name=label,
+                        line=dict(color=color, width=1.5),
+                        marker=dict(size=6),
+                    )
+                )
+
+                fig_pred.update_layout(
+                    template="plotly_white",
+                    height=500,
+                    xaxis_title="Temps",
+                    yaxis_title="Quantité",
+                    legend=dict(x=0.01, y=0.99),
+                    title=f"Prévisions H={forecast_horizon} - {result['model_used']}",
+                )
+
+                st.plotly_chart(fig_pred, use_container_width=True)
+
+                # Export Excel prévisions avec somme
+                forecast_df = pd.DataFrame({
+                    "Date": future_index,
+                    "Prévision_moyenne": predictions,
+                    "IC_95_bas": lower_bound,
+                    "IC_95_haut": upper_bound,
+                    "Trajectoire_simulée": simulated_path,
+                })
+
+                if median_predictions is not None:
+                    forecast_df["Prévision_médiane"] = median_predictions
+
+                forecast_buffer = create_forecast_excel_with_sum(forecast_df, selected_article)
+
+                st.download_button(
+                    label="📥 Télécharger les prévisions (Excel avec TOTAL)",
+                    data=forecast_buffer,
+                    file_name=f"previsions_{selected_article}_H{forecast_horizon}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="download_forecast_single"
+                )
+
+            elif result:
+                st.error(f"❌ Erreur lors de la prévision : {result.get('error', 'Erreur inconnue')}")
+
+    # ========================================
+    # TAB 2 : BATCH FORECAST
+    # ========================================
+    with tab2:
+        st.subheader("🚀 Prévision Batch - Multiples Articles")
+        st.markdown("Lancez des prévisions sur plusieurs articles en une seule fois et téléchargez tous les résultats.")
+
+        # Sélection des articles
+        batch_search = st.text_input(
+            "🔎 Filtrer les articles :",
+            value="",
+            placeholder="Tapez pour filtrer...",
+            key="search_batch"
+        )
+
+        articles_sorted = ranking["Description article"].tolist()
+        if batch_search:
+            filtered_batch = [a for a in articles_sorted if batch_search.lower() in a.lower()]
+        else:
+            filtered_batch = articles_sorted
+
+        selected_articles = st.multiselect(
+            "📦 Sélectionnez les articles (plusieurs possibles) :",
+            filtered_batch,
+            default=[],
+            key="select_batch"
+        )
+
+        st.write(f"**{len(selected_articles)}** article(s) sélectionné(s)")
+
+        # Paramètres batch
+        col1, col2 = st.columns(2)
+        with col1:
+            batch_freq = st.radio("📅 Fréquence :", ("Jour", "Semaine", "Mois"), horizontal=True, key="freq_batch")
+        with col2:
+            batch_horizon = st.selectbox(
+                "🎯 Horizon de prévision :",
+                ["7 jours", "30 jours", "60 jours", "90 jours"],
+                index=1,
+                key="horizon_batch"
             )
 
-            fig_pred.update_layout(
-                template="plotly_white",
-                height=500,
-                xaxis_title="Temps",
-                yaxis_title="Quantité",
-                legend=dict(x=0.01, y=0.99),
-                title=f"Prévisions H={forecast_horizon} - {result['model_used']}",
-            )
+        if batch_freq == "Jour":
+            freq_batch_val = "D"
+        elif batch_freq == "Semaine":
+            freq_batch_val = "W-MON"
+        else:
+            freq_batch_val = "M"
 
-            st.plotly_chart(fig_pred, use_container_width=True)
+        if batch_horizon == "7 jours":
+            horizon_batch_val = 7
+        elif batch_horizon == "30 jours":
+            horizon_batch_val = 30
+        elif batch_horizon == "60 jours":
+            horizon_batch_val = 60
+        else:
+            horizon_batch_val = 90
 
-            # Export Excel prévisions
-            forecast_df = pd.DataFrame({
-                "Date": future_index,
-                "Prévision_moyenne": predictions,
-                "IC_95_bas": lower_bound,
-                "IC_95_haut": upper_bound,
-                "Trajectoire_simulée": simulated_path,
-            })
+        run_batch = st.button("🚀 Lancer le Batch Forecast", key="run_batch", type="primary")
 
-            if median_predictions is not None:
-                forecast_df["Prévision_médiane"] = median_predictions
+        if run_batch and len(selected_articles) > 0:
+            st.info(f"🔄 Traitement de {len(selected_articles)} article(s)...")
 
-            forecast_buffer = io.BytesIO()
-            forecast_df.to_excel(forecast_buffer, sheet_name="Prévisions", index=False)
-            forecast_buffer.seek(0)
+            # Initialiser stockage des résultats
+            if 'batch_results' not in st.session_state:
+                st.session_state.batch_results = {}
 
-            st.download_button(
-                label="📥 Télécharger les prévisions (Excel)",
-                data=forecast_buffer,
-                file_name=f"previsions_{selected_article}_H{forecast_horizon}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            st.session_state.batch_results = {}  # Reset
 
-        elif result:
-            st.error(f"❌ Erreur lors de la prévision : {result.get('error', 'Erreur inconnue')}")
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+
+            all_forecasts = []
+
+            for idx, article in enumerate(selected_articles):
+                status_text.text(f"⏳ Traitement de {article} ({idx+1}/{len(selected_articles)})...")
+
+                # Préparer données
+                df_agg_batch = aggregate_quantities(df_daily, freq=freq_batch_val)
+                df_art = df_agg_batch[df_agg_batch["Description article"] == article].copy()
+                df_art = df_art.sort_values("Période")
+
+                # Trimming
+                nonzero_mask = df_art["Quantité_totale"] != 0
+                if nonzero_mask.any():
+                    first_idx = df_art.index[nonzero_mask][0]
+                    last_idx = df_art.index[nonzero_mask][-1]
+                    df_art = df_art.loc[first_idx:last_idx]
+
+                if df_art.empty:
+                    st.warning(f"⚠️ Pas de données pour {article}, ignoré.")
+                    continue
+
+                series_data = df_art.set_index("Période")["Quantité_totale"]
+
+                # Appel API
+                result = call_modal_api(
+                    series_data=series_data.values,
+                    horizon=horizon_batch_val,
+                    dates=series_data.index,
+                    product_name=article
+                )
+
+                if result and result.get("success"):
+                    # Stocker résultat
+                    st.session_state.batch_results[article] = result
+
+                    # Construction future index
+                    if isinstance(series_data.index, pd.DatetimeIndex):
+                        inferred_freq = pd.infer_freq(series_data.index)
+                        if inferred_freq is None:
+                            inferred_freq = "D"
+                        start_future = series_data.index[-1] + pd.tseries.frequencies.to_offset(inferred_freq)
+                        future_index = pd.date_range(start=start_future, periods=horizon_batch_val, freq=inferred_freq)
+                    else:
+                        last_idx = series_data.index[-1]
+                        future_index = np.arange(last_idx + 1, last_idx + 1 + horizon_batch_val)
+
+                    # Créer DataFrame prévision
+                    forecast_df = pd.DataFrame({
+                        "Article": article,
+                        "Date": future_index,
+                        "Prévision_moyenne": result["predictions"],
+                        "IC_95_bas": result["lower_bound"],
+                        "IC_95_haut": result["upper_bound"],
+                        "Trajectoire_simulée": result["simulated_path"],
+                        "Modèle": result["model_used"]
+                    })
+
+                    if result.get("median_predictions"):
+                        forecast_df["Prévision_médiane"] = result["median_predictions"]
+
+                    all_forecasts.append(forecast_df)
+
+                else:
+                    st.warning(f"⚠️ Échec pour {article}: {result.get('error', 'Erreur inconnue')}")
+
+                progress_bar.progress((idx + 1) / len(selected_articles))
+
+            status_text.text("✅ Batch terminé !")
+            st.success(f"✅ Prévisions générées pour {len(all_forecasts)}/{len(selected_articles)} article(s)")
+
+            # Affichage résumé
+            if all_forecasts:
+                st.subheader("📊 Résumé des prévisions")
+
+                summary_data = []
+                for article, res in st.session_state.batch_results.items():
+                    summary_data.append({
+                        "Article": article,
+                        "Modèle utilisé": res["model_used"],
+                        "Total prévu (moyenne)": sum(res["predictions"]),
+                        "Zero ratio": f"{res['routing_info']['zero_ratio']*100:.1f}%"
+                    })
+
+                summary_df = pd.DataFrame(summary_data)
+                st.dataframe(summary_df, use_container_width=True)
+
+                # Téléchargement groupé
+                st.subheader("📥 Téléchargement des prévisions")
+
+                combined_df = pd.concat(all_forecasts, ignore_index=True)
+
+                # Créer Excel avec toutes les prévisions
+                batch_buffer = io.BytesIO()
+                with pd.ExcelWriter(batch_buffer, engine='openpyxl') as writer:
+                    # Une feuille par article
+                    for article in combined_df["Article"].unique():
+                        article_df = combined_df[combined_df["Article"] == article].copy()
+                        article_df = article_df.drop(columns=["Article"])
+
+                        # Ajouter ligne somme
+                        sum_row = {}
+                        for col in article_df.columns:
+                            if col == "Date":
+                                sum_row[col] = "TOTAL"
+                            elif col == "Modèle":
+                                sum_row[col] = ""
+                            elif pd.api.types.is_numeric_dtype(article_df[col]):
+                                sum_row[col] = article_df[col].sum()
+                            else:
+                                sum_row[col] = ""
+
+                        article_df_with_sum = pd.concat([article_df, pd.DataFrame([sum_row])], ignore_index=True)
+
+                        sheet_name = article[:31]  # Excel limit
+                        article_df_with_sum.to_excel(writer, sheet_name=sheet_name, index=False)
+
+                        # Formater dernière ligne
+                        from openpyxl.styles import Font
+                        worksheet = writer.sheets[sheet_name]
+                        last_row = len(article_df_with_sum) + 1
+                        for cell in worksheet[last_row]:
+                            cell.font = Font(bold=True)
+
+                    # Feuille de synthèse
+                    summary_df.to_excel(writer, sheet_name="Synthèse", index=False)
+
+                batch_buffer.seek(0)
+
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                st.download_button(
+                    label=f"📥 Télécharger TOUTES les prévisions ({len(all_forecasts)} articles)",
+                    data=batch_buffer,
+                    file_name=f"batch_forecast_{timestamp}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="download_batch",
+                    type="primary"
+                )
+
+        elif run_batch:
+            st.warning("⚠️ Veuillez sélectionner au moins un article.")
