@@ -346,6 +346,21 @@ if uploaded_file is not None:
                     dates=series_hist.index,
                     product_name=selected_article
                 )
+                # Stocker dans session_state
+                st.session_state.single_forecast_result = {
+                    'result': result,
+                    'series_hist': series_hist,
+                    'forecast_horizon': forecast_horizon,
+                    'selected_article': selected_article
+                }
+
+        # Afficher depuis session_state si disponible
+        if 'single_forecast_result' in st.session_state:
+            stored = st.session_state.single_forecast_result
+            result = stored['result']
+            series_hist = stored['series_hist']
+            forecast_horizon = stored['forecast_horizon']
+            selected_article = stored['selected_article']
 
             if result and result.get("success"):
                 st.success(f"✅ Prévision réussie avec le modèle : **{result['model_used']}**")
@@ -658,8 +673,151 @@ if uploaded_file is not None:
                 summary_df = pd.DataFrame(summary_data)
                 st.dataframe(summary_df, use_container_width=True)
 
+                # Visualisation individuelle par article
+                st.subheader("📊 Visualisation par article")
+
+                selected_viz_article = st.selectbox(
+                    "Sélectionnez un article pour voir son graphique :",
+                    list(st.session_state.batch_results.keys()),
+                    key="viz_article_select"
+                )
+
+                if selected_viz_article:
+                    viz_result = st.session_state.batch_results[selected_viz_article]
+
+                    # Récupérer les données historiques de cet article
+                    df_agg_viz = aggregate_quantities(df_daily, freq=freq_batch_val)
+                    df_art_viz = df_agg_viz[df_agg_viz["Description article"] == selected_viz_article].copy()
+                    df_art_viz = df_art_viz.sort_values("Période")
+
+                    # Trimming
+                    nonzero_mask_viz = df_art_viz["Quantité_totale"] != 0
+                    if nonzero_mask_viz.any():
+                        first_idx_viz = df_art_viz.index[nonzero_mask_viz][0]
+                        last_idx_viz = df_art_viz.index[nonzero_mask_viz][-1]
+                        df_art_viz = df_art_viz.loc[first_idx_viz:last_idx_viz]
+
+                    series_viz = df_art_viz.set_index("Période")["Quantité_totale"]
+
+                    # Construction future index
+                    if isinstance(series_viz.index, pd.DatetimeIndex):
+                        inferred_freq_viz = pd.infer_freq(series_viz.index)
+                        if inferred_freq_viz is None:
+                            inferred_freq_viz = "D"
+                        start_future_viz = series_viz.index[-1] + pd.tseries.frequencies.to_offset(inferred_freq_viz)
+                        future_index_viz = pd.date_range(start=start_future_viz, periods=horizon_batch_val, freq=inferred_freq_viz)
+                    else:
+                        last_idx_viz = series_viz.index[-1]
+                        future_index_viz = np.arange(last_idx_viz + 1, last_idx_viz + 1 + horizon_batch_val)
+
+                    # Créer graphique
+                    fig_viz = go.Figure()
+
+                    # Historique
+                    fig_viz.add_trace(
+                        go.Scatter(
+                            x=series_viz.index,
+                            y=series_viz.values,
+                            mode="lines",
+                            name="Historique",
+                            line=dict(color="black", width=1.5),
+                        )
+                    )
+
+                    # Prévision moyenne
+                    fig_viz.add_trace(
+                        go.Scatter(
+                            x=future_index_viz,
+                            y=viz_result["predictions"],
+                            mode="lines",
+                            name="Prévision (moyenne)",
+                            line=dict(color="blue", width=2),
+                        )
+                    )
+
+                    # IC
+                    fig_viz.add_trace(
+                        go.Scatter(
+                            x=future_index_viz,
+                            y=viz_result["upper_bound"],
+                            mode="lines",
+                            name="IC 95%",
+                            line=dict(color="rgba(0,100,255,0.3)", width=1, dash="dot"),
+                            showlegend=False,
+                        )
+                    )
+
+                    fig_viz.add_trace(
+                        go.Scatter(
+                            x=future_index_viz,
+                            y=viz_result["lower_bound"],
+                            mode="lines",
+                            name="IC 95%",
+                            line=dict(color="rgba(0,100,255,0.3)", width=1, dash="dot"),
+                            fill="tonexty",
+                            fillcolor="rgba(0,100,255,0.2)",
+                        )
+                    )
+
+                    # Trajectoire
+                    if viz_result["model_used"] == "BayesianLSTM":
+                        label_viz = "Trajectoire simulée (MC Dropout)"
+                        color_viz = "rgba(124, 252, 0, 0.9)"
+                    elif viz_result["model_used"] == "SparseSpikeForecaster":
+                        label_viz = "Pics périodiques simulés"
+                        color_viz = "rgba(255, 165, 0, 0.9)"
+                    else:
+                        label_viz = "Scénario simulé 0/spikes"
+                        color_viz = "rgba(255, 0, 0, 0.9)"
+
+                    fig_viz.add_trace(
+                        go.Scatter(
+                            x=future_index_viz,
+                            y=viz_result["simulated_path"],
+                            mode="markers+lines",
+                            name=label_viz,
+                            line=dict(color=color_viz, width=1.5),
+                            marker=dict(size=6),
+                        )
+                    )
+
+                    fig_viz.update_layout(
+                        template="plotly_white",
+                        height=500,
+                        xaxis_title="Temps",
+                        yaxis_title="Quantité",
+                        legend=dict(x=0.01, y=0.99),
+                        title=f"{selected_viz_article} - {viz_result['model_used']}",
+                    )
+
+                    st.plotly_chart(fig_viz, use_container_width=True)
+
+                    # Téléchargement individuel
+                    st.caption(f"📥 Téléchargement pour {selected_viz_article}")
+
+                    forecast_df_viz = pd.DataFrame({
+                        "Date": future_index_viz,
+                        "Prévision_moyenne": viz_result["predictions"],
+                        "IC_95_bas": viz_result["lower_bound"],
+                        "IC_95_haut": viz_result["upper_bound"],
+                        "Trajectoire_simulée": viz_result["simulated_path"],
+                    })
+
+                    if viz_result.get("median_predictions"):
+                        forecast_df_viz["Prévision_médiane"] = viz_result["median_predictions"]
+
+                    individual_buffer = create_forecast_excel_with_sum(forecast_df_viz, selected_viz_article)
+
+                    st.download_button(
+                        label=f"📥 Télécharger prévision de {selected_viz_article}",
+                        data=individual_buffer,
+                        file_name=f"prevision_{selected_viz_article}_H{horizon_batch_val}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key=f"download_individual_{selected_viz_article}"
+                    )
+
                 # Téléchargement groupé
-                st.subheader("📥 Téléchargement des prévisions")
+                st.subheader("📥 Téléchargement groupé de tous les articles")
 
                 combined_df = pd.concat(all_forecasts, ignore_index=True)
 
