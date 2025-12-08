@@ -579,10 +579,12 @@ if uploaded_file is not None:
             st.info(f"🔄 Traitement de {len(selected_articles)} article(s)...")
 
             # Initialiser stockage des résultats
-            if 'batch_results' not in st.session_state:
-                st.session_state.batch_results = {}
-
             st.session_state.batch_results = {}  # Reset
+            st.session_state.all_forecasts = []  # Reset
+            st.session_state.batch_config = {
+                'freq': freq_batch_val,
+                'horizon': horizon_batch_val
+            }
 
             progress_bar = st.progress(0)
             status_text = st.empty()
@@ -654,11 +656,19 @@ if uploaded_file is not None:
 
                 progress_bar.progress((idx + 1) / len(selected_articles))
 
+            # Stocker all_forecasts dans session_state
+            st.session_state.all_forecasts = all_forecasts
+
             status_text.text("✅ Batch terminé !")
             st.success(f"✅ Prévisions générées pour {len(all_forecasts)}/{len(selected_articles)} article(s)")
 
-            # Affichage résumé
-            if all_forecasts:
+        # Afficher depuis session_state si disponible
+        if 'all_forecasts' in st.session_state and len(st.session_state.all_forecasts) > 0:
+            all_forecasts = st.session_state.all_forecasts
+            freq_batch_val = st.session_state.batch_config['freq']
+            horizon_batch_val = st.session_state.batch_config['horizon']
+
+            if True:  # Always display if we have results
                 st.subheader("📊 Résumé des prévisions")
 
                 summary_data = []
@@ -873,5 +883,5 @@ if uploaded_file is not None:
                     type="primary"
                 )
 
-        elif run_batch:
+        elif run_batch and len(selected_articles) == 0:
             st.warning("⚠️ Veuillez sélectionner au moins un article.")
