@@ -13,7 +13,12 @@ import streamlit as st
 import pandas as pd
 import tempfile
 import os
-from datetime import datetime
+from datetime import datetime, date, timedelta
+from dateutil.relativedelta import relativedelta
+import holidays
+
+# Constants
+DATA_MIN = 50  # Minimum de points de données requis
 
 # Configuration
 IS_STREAMLIT_CLOUD = os.getenv("STREAMLIT_RUNTIME_ENV") == "cloud" or not os.path.exists("/home")
@@ -98,8 +103,114 @@ def aggregate_quantities(df_daily, freq="D"):
     return agg
 
 
-def call_modal_api(series_data, horizon, dates=None, product_name="Unknown"):
-    """Appelle l'API Modal pour obtenir des prévisions."""
+def working_days_between_fr(start_date, end_date):
+    """
+    Calcule la liste des jours ouvrés français entre deux dates.
+    Exclut les dimanches et les jours fériés français.
+    Intervalle : start_date exclue → end_date incluse.
+    """
+    # Normalisation
+    if isinstance(start_date, datetime):
+        start = start_date.date()
+    else:
+        start = start_date
+
+    if isinstance(end_date, datetime):
+        end = end_date.date()
+    else:
+        end = end_date
+
+    # S'assure que start <= end
+    if end < start:
+        start, end = end, start
+
+    # Jours fériés FR pour toutes les années couvertes
+    years = set(range(start.year, end.year + 1))
+    fr_holidays = holidays.country_holidays("FR", years=years)
+    working_days = []
+    current = start
+
+    while current < end:
+        current += timedelta(days=1)
+
+        # Dimanche
+        if current.weekday() == 6:
+            continue
+
+        # Jour férié
+        if current in fr_holidays:
+            continue
+
+        working_days.append(current)
+
+    return working_days
+
+
+def periods_in_days_fr(start_date):
+    """
+    Donne pour différentes périodes :
+      - la date finale
+      - le nombre total de jours calendaires
+      - le nombre de jours ouvrés français
+    """
+    # Normalisation
+    if isinstance(start_date, datetime):
+        start = start_date.date()
+    else:
+        start = start_date
+
+    periods = {
+        "1_semaine": {"weeks": 1},
+        "1_mois": {"months": 1},
+        "3_mois": {"months": 3},
+        "6_mois": {"months": 6},
+        "9_mois": {"months": 9},
+    }
+
+    results = {}
+
+    for label, delta_kwargs in periods.items():
+        end = start + relativedelta(**delta_kwargs)
+
+        jours_calendaires = (end - start).days
+        jours_ouvres = working_days_between_fr(start, end)
+
+        results[label] = {
+            "date_fin": end,
+            "jours_calendaires": jours_calendaires,
+            "jours_ouvres_fr": len(jours_ouvres),
+        }
+
+    return results
+
+
+def keep_business_day(df_agg):
+    """
+    Filtre le DataFrame pour ne garder que les dates avec quantité > 0.
+    Élimine les jours non-ouvrés (zéros) du dataset.
+    """
+    # 1. Calculer la quantité totale par date
+    somme_par_date = df_agg.groupby("Période")["Quantité_totale"].sum()
+
+    # 2. Garder uniquement les dates dont la somme est > 0
+    dates_valides = somme_par_date[somme_par_date > 0].index
+
+    # 3. Filtrer le DataFrame final
+    df_filtre = df_agg[df_agg["Période"].isin(dates_valides)].copy()
+    return df_filtre
+
+
+def call_modal_api(series_data, horizon, dates=None, product_name="Unknown", timeout=900):
+    """
+    Appelle l'API Modal pour obtenir des prévisions.
+
+    Args:
+        series_data: Données de la série temporelle
+        horizon: Horizon de prévision
+        dates: Dates optionnelles
+        product_name: Nom du produit
+        timeout: Timeout en secondes (défaut: 900s = 15min pour batch)
+    """
     payload = {
         "product_name": product_name,
         "series": series_data.tolist() if isinstance(series_data, np.ndarray) else list(series_data),
@@ -110,9 +221,12 @@ def call_modal_api(series_data, horizon, dates=None, product_name="Unknown"):
         payload["dates"] = [d.isoformat() if hasattr(d, 'isoformat') else str(d) for d in dates]
 
     try:
-        response = requests.post(MODAL_API_URL, json=payload, timeout=600)
+        response = requests.post(MODAL_API_URL, json=payload, timeout=timeout)
         response.raise_for_status()
         return response.json()
+    except requests.exceptions.Timeout:
+        logger.error(f"API Timeout for {product_name} after {timeout}s")
+        return {"success": False, "error": f"Timeout après {timeout}s - l'API n'a pas répondu à temps"}
     except requests.exceptions.RequestException as e:
         logger.error(f"API Error for {product_name}: {e}")
         return {"success": False, "error": str(e)}
@@ -231,16 +345,15 @@ if uploaded_file is not None:
 
         selected_article = st.selectbox("📦 Article :", filtered_articles, key="select_single")
 
-        freq_label = st.radio("📅 Fréquence d'agrégation :", ("Jour", "Semaine", "Mois"), horizontal=True, key="freq_single")
+        freq_label = st.radio("📅 Fréquence d'agrégation :", ("Jour", "Semaine (Ne pas utiliser)"), horizontal=True, key="freq_single")
 
         if freq_label == "Jour":
             freq = "D"
-        elif freq_label == "Semaine":
-            freq = "W-MON"
         else:
-            freq = "M"
+            freq = "W-MON"
 
-        df_agg = aggregate_quantities(df_daily, freq=freq)
+        df_agg_wo_bd = aggregate_quantities(df_daily, freq=freq)
+        df_agg = keep_business_day(df_agg_wo_bd)
         df_article = df_agg[df_agg["Description article"] == selected_article].copy()
         df_article = df_article.sort_values("Période")
 
@@ -251,16 +364,16 @@ if uploaded_file is not None:
             last_idx = df_article.index[nonzero_mask][-1]
             df_article = df_article.loc[first_idx:last_idx]
 
-        # Sélection de fenêtre temporelle
-        if not df_article.empty:
+        # Sélection de fenêtre temporelle et validation DATA_MIN
+        if df_article.shape[0] > DATA_MIN:
             min_date = df_article["Période"].min().date()
             max_date = df_article["Période"].max().date()
 
             col_start, col_end = st.columns(2)
             with col_start:
-                start_date = st.date_input("📅 Date de début", value=min_date, min_value=min_date, max_value=max_date, key="start_single")
+                start_date = st.date_input("📅 Date de début de l'historique", value=min_date, min_value=min_date, max_value=max_date, key="start_single")
             with col_end:
-                end_date = st.date_input("📅 Date de fin", value=max_date, min_value=start_date, max_value=max_date, key="end_single")
+                end_date = st.date_input("📅 Date de fin de l'historique", value=max_date, min_value=start_date, max_value=max_date, key="end_single")
 
             mask_window = (
                 (df_article["Période"] >= pd.to_datetime(start_date)) &
@@ -272,7 +385,7 @@ if uploaded_file is not None:
                 st.warning("La fenêtre de dates choisie ne contient aucune donnée.")
                 st.stop()
         else:
-            st.warning("Aucune donnée non nulle pour cet article.")
+            st.warning(f"⚠️ Pas assez de données pour cet article (minimum {DATA_MIN} points requis).")
             st.stop()
 
         st.write(f"📦 Article sélectionné : **{selected_article}**")
@@ -322,23 +435,37 @@ if uploaded_file is not None:
         # Prévision IA
         st.subheader("🤖 Prévision IA (via API Modal)")
 
-        horizon_choice = st.selectbox(
-            "Horizon de prévision :",
-            ["Aucune", "7 jours", "30 jours", "60 jours", "90 jours"],
-            index=0,
-            key="horizon_single"
-        )
+        # Sélection période de forecast avec jours ouvrés français
+        min_date_forecast = df_article["Période"].min().date()
+        max_date_forecast = df_article["Période"].max().date()
 
-        if horizon_choice == "Aucune":
-            forecast_horizon = None
-        elif horizon_choice == "7 jours":
-            forecast_horizon = 7
-        elif horizon_choice == "30 jours":
-            forecast_horizon = 30
-        elif horizon_choice == "60 jours":
-            forecast_horizon = 60
+        col_forecast_start, col_forecast_end = st.columns(2)
+        with col_forecast_start:
+            forecast_start_date = st.date_input(
+                "📅 Date de début du forecast",
+                value=max_date_forecast,
+                min_value=min_date_forecast,
+                max_value=max_date_forecast,
+                key="forecast_start_single"
+            )
+        with col_forecast_end:
+            forecast_end_date = st.date_input(
+                "📅 Date de fin du forecast",
+                value=max_date_forecast,
+                min_value=max_date_forecast,
+                max_value=max_date_forecast + relativedelta(years=1),
+                key="forecast_end_single"
+            )
+
+        # Calcul automatique des jours ouvrés français
+        list_dates_business_day = working_days_between_fr(forecast_start_date, forecast_end_date)
+        forecast_horizon = len(list_dates_business_day)
+
+        if forecast_horizon > 0:
+            st.info(f"📊 Horizon calculé : **{forecast_horizon} jours ouvrés** français (hors dimanches et jours fériés)")
         else:
-            forecast_horizon = 90
+            st.warning("⚠️ Aucun jour ouvré dans la période sélectionnée.")
+            forecast_horizon = None
 
         run_forecast = st.button("🚀 Lancer la prévision IA", key="run_single")
 
@@ -355,7 +482,8 @@ if uploaded_file is not None:
                     'result': result,
                     'series_hist': series_hist,
                     'forecast_horizon': forecast_horizon,
-                    'selected_article': selected_article
+                    'selected_article': selected_article,
+                    'future_index': list_dates_business_day  # Utiliser les jours ouvrés
                 }
 
         # Afficher depuis session_state si disponible
@@ -365,6 +493,7 @@ if uploaded_file is not None:
             series_hist = stored['series_hist']
             forecast_horizon = stored['forecast_horizon']
             selected_article = stored['selected_article']
+            future_index = stored.get('future_index', [])  # Utiliser les jours ouvrés stockés
 
             if result and result.get("success"):
                 st.success(f"✅ Prévision réussie avec le modèle : **{result['model_used']}**")
@@ -379,17 +508,6 @@ if uploaded_file is not None:
                     st.metric("Dispersion", f"{routing_info.get('dispersion', 0):.3f}")
                 with col3:
                     st.metric("Autocorrélation", f"{routing_info.get('acf_lag1', 0):.3f}")
-
-                # Construction de l'index futur
-                if isinstance(series_hist.index, pd.DatetimeIndex):
-                    inferred_freq = pd.infer_freq(series_hist.index)
-                    if inferred_freq is None:
-                        inferred_freq = "D"
-                    start_future = series_hist.index[-1] + pd.tseries.frequencies.to_offset(inferred_freq)
-                    future_index = pd.date_range(start=start_future, periods=forecast_horizon, freq=inferred_freq)
-                else:
-                    last_idx = series_hist.index[-1]
-                    future_index = np.arange(last_idx + 1, last_idx + 1 + forecast_horizon)
 
                 # Extraction des résultats
                 predictions = np.array(result["predictions"])
@@ -549,24 +667,25 @@ if uploaded_file is not None:
 
         st.write(f"**{len(selected_articles)}** article(s) sélectionné(s)")
 
-        # Paramètres batch
-        col1, col2 = st.columns(2)
-        with col1:
-            batch_freq = st.radio("📅 Fréquence :", ("Jour", "Semaine", "Mois"), horizontal=True, key="freq_batch")
-        with col2:
-            batch_horizon = st.selectbox(
-                "🎯 Horizon de prévision :",
-                ["7 jours", "30 jours", "60 jours", "90 jours"],
-                index=1,
-                key="horizon_batch"
+        # Avertissement pour les gros batchs
+        if len(selected_articles) > 10:
+            st.info(
+                f"⏱️ **Gros batch détecté ({len(selected_articles)} articles)**\n\n"
+                "Le traitement peut prendre du temps (~2-5 min/article).\n"
+                "- Temps estimé : ~" + str(len(selected_articles) * 3) + " minutes\n"
+                "- Ne fermez pas cette page pendant le traitement\n"
+                "- Les résultats seront sauvegardés automatiquement"
             )
 
-        # Sélection de plage de dates pour le batch
+        # Paramètres batch
+        batch_freq = st.radio("📅 Fréquence :", ("Jour", "Semaine (Ne pas utiliser)"), horizontal=True, key="freq_batch")
+
+        # Sélection de plage de dates pour l'historique
         st.subheader("📅 Plage de dates pour l'historique")
 
         # Obtenir min/max dates globales
         if len(selected_articles) > 0:
-            temp_freq = "D" if batch_freq == "Jour" else ("W-MON" if batch_freq == "Semaine" else "M")
+            temp_freq = "D" if batch_freq == "Jour" else "W-MON"
             df_temp = aggregate_quantities(df_daily, freq=temp_freq)
             all_dates = df_temp["Période"].unique()
             global_min_date = pd.to_datetime(all_dates).min().date()
@@ -578,7 +697,7 @@ if uploaded_file is not None:
         col_batch_start, col_batch_end = st.columns(2)
         with col_batch_start:
             batch_start_date = st.date_input(
-                "📅 Date de début",
+                "📅 Date de début de l'historique",
                 value=global_min_date,
                 min_value=global_min_date,
                 max_value=global_max_date,
@@ -586,32 +705,51 @@ if uploaded_file is not None:
             )
         with col_batch_end:
             batch_end_date = st.date_input(
-                "📅 Date de fin",
+                "📅 Date de fin de l'historique",
                 value=global_max_date,
                 min_value=batch_start_date,
                 max_value=global_max_date,
                 key="batch_end_date"
             )
 
+        # Sélection période de forecast avec jours ouvrés
+        st.subheader("📅 Période de forecast")
+
+        col_forecast_batch_start, col_forecast_batch_end = st.columns(2)
+        with col_forecast_batch_start:
+            forecast_batch_start_date = st.date_input(
+                "📅 Date de début du forecast",
+                value=global_max_date,
+                min_value=global_min_date,
+                max_value=global_max_date,
+                key="forecast_batch_start_date"
+            )
+        with col_forecast_batch_end:
+            forecast_batch_end_date = st.date_input(
+                "📅 Date de fin du forecast",
+                value=global_max_date,
+                min_value=global_max_date,
+                max_value=global_max_date + relativedelta(years=1),
+                key="forecast_batch_end_date"
+            )
+
+        # Calcul automatique des jours ouvrés français
+        list_dates_batch_business_day = working_days_between_fr(forecast_batch_start_date, forecast_batch_end_date)
+        horizon_batch_val = len(list_dates_batch_business_day)
+
+        if horizon_batch_val > 0:
+            st.info(f"📊 Horizon calculé : **{horizon_batch_val} jours ouvrés** français (hors dimanches et jours fériés)")
+        else:
+            st.warning("⚠️ Aucun jour ouvré dans la période de forecast sélectionnée.")
+
         if batch_freq == "Jour":
             freq_batch_val = "D"
-        elif batch_freq == "Semaine":
+        else:
             freq_batch_val = "W-MON"
-        else:
-            freq_batch_val = "M"
-
-        if batch_horizon == "7 jours":
-            horizon_batch_val = 7
-        elif batch_horizon == "30 jours":
-            horizon_batch_val = 30
-        elif batch_horizon == "60 jours":
-            horizon_batch_val = 60
-        else:
-            horizon_batch_val = 90
 
         run_batch = st.button("🚀 Lancer le Batch Forecast", key="run_batch", type="primary")
 
-        if run_batch and len(selected_articles) > 0:
+        if run_batch and len(selected_articles) > 0 and horizon_batch_val > 0:
             st.info(f"🔄 Traitement de {len(selected_articles)} article(s)...")
 
             # Initialiser stockage des résultats
@@ -621,7 +759,8 @@ if uploaded_file is not None:
                 'freq': freq_batch_val,
                 'horizon': horizon_batch_val,
                 'start_date': batch_start_date,
-                'end_date': batch_end_date
+                'end_date': batch_end_date,
+                'future_index': list_dates_batch_business_day  # Stocker les jours ouvrés
             }
 
             progress_bar = st.progress(0)
@@ -629,89 +768,122 @@ if uploaded_file is not None:
 
             all_forecasts = []
 
+            failed_articles = []
+            success_count = 0
+
             for idx, article in enumerate(selected_articles):
-                status_text.text(f"⏳ Traitement de {article} ({idx+1}/{len(selected_articles)})...")
+                # Mise à jour statut détaillé pour maintenir la connexion
+                status_text.text(f"⏳ [{idx+1}/{len(selected_articles)}] {article}")
+                progress_bar.progress((idx) / len(selected_articles))
 
-                # Préparer données
-                df_agg_batch = aggregate_quantities(df_daily, freq=freq_batch_val)
-                df_art = df_agg_batch[df_agg_batch["Description article"] == article].copy()
-                df_art = df_art.sort_values("Période")
+                try:
+                    # Préparer données avec filtrage business days
+                    df_agg_batch_wo_bd = aggregate_quantities(df_daily, freq=freq_batch_val)
+                    df_agg_batch = keep_business_day(df_agg_batch_wo_bd)
+                    df_art = df_agg_batch[df_agg_batch["Description article"] == article].copy()
+                    df_art = df_art.sort_values("Période")
 
-                # Trimming
-                nonzero_mask = df_art["Quantité_totale"] != 0
-                if nonzero_mask.any():
-                    first_idx = df_art.index[nonzero_mask][0]
-                    last_idx = df_art.index[nonzero_mask][-1]
-                    df_art = df_art.loc[first_idx:last_idx]
+                    # Trimming
+                    nonzero_mask = df_art["Quantité_totale"] != 0
+                    if nonzero_mask.any():
+                        first_idx = df_art.index[nonzero_mask][0]
+                        last_idx = df_art.index[nonzero_mask][-1]
+                        df_art = df_art.loc[first_idx:last_idx]
 
-                # Apply date range filter
-                mask_batch_window = (
-                    (df_art["Période"] >= pd.to_datetime(batch_start_date)) &
-                    (df_art["Période"] <= pd.to_datetime(batch_end_date))
-                )
-                df_art = df_art.loc[mask_batch_window].copy()
+                    # Apply date range filter
+                    mask_batch_window = (
+                        (df_art["Période"] >= pd.to_datetime(batch_start_date)) &
+                        (df_art["Période"] <= pd.to_datetime(batch_end_date))
+                    )
+                    df_art = df_art.loc[mask_batch_window].copy()
 
-                if df_art.empty:
-                    st.warning(f"⚠️ Pas de données pour {article}, ignoré.")
-                    continue
+                    if df_art.empty:
+                        st.warning(f"⚠️ Pas de données pour {article}, ignoré.")
+                        failed_articles.append((article, "Pas de données"))
+                        continue
 
-                series_data = df_art.set_index("Période")["Quantité_totale"]
+                    if df_art.shape[0] < DATA_MIN:
+                        st.warning(f"⚠️ Pas assez de données pour {article} ({df_art.shape[0]} < {DATA_MIN}), ignoré.")
+                        failed_articles.append((article, f"Insuffisant ({df_art.shape[0]} points)"))
+                        continue
 
-                # Appel API
-                result = call_modal_api(
-                    series_data=series_data.values,
-                    horizon=horizon_batch_val,
-                    dates=series_data.index,
-                    product_name=article
-                )
+                    series_data = df_art.set_index("Période")["Quantité_totale"]
 
-                if result and result.get("success"):
-                    # Stocker résultat
-                    st.session_state.batch_results[article] = result
+                    # Mise à jour statut - Appel API
+                    status_text.text(f"⏳ [{idx+1}/{len(selected_articles)}] {article} - Appel API en cours...")
 
-                    # Construction future index
-                    if isinstance(series_data.index, pd.DatetimeIndex):
-                        inferred_freq = pd.infer_freq(series_data.index)
-                        if inferred_freq is None:
-                            inferred_freq = "D"
-                        start_future = series_data.index[-1] + pd.tseries.frequencies.to_offset(inferred_freq)
-                        future_index = pd.date_range(start=start_future, periods=horizon_batch_val, freq=inferred_freq)
+                    # Appel API avec timeout adapté
+                    result = call_modal_api(
+                        series_data=series_data.values,
+                        horizon=horizon_batch_val,
+                        dates=series_data.index,
+                        product_name=article,
+                        timeout=900  # 15 minutes par article
+                    )
+
+                    if result and result.get("success"):
+                        # Stocker résultat
+                        st.session_state.batch_results[article] = result
+                        success_count += 1
+
+                        # Utiliser les jours ouvrés français comme future_index
+                        future_index = list_dates_batch_business_day
+
+                        # Créer DataFrame prévision
+                        forecast_df = pd.DataFrame({
+                            "Article": article,
+                            "Date": future_index,
+                            "Prévision_moyenne": result["predictions"],
+                            "IC_95_bas": result["lower_bound"],
+                            "IC_95_haut": result["upper_bound"],
+                            "Trajectoire_simulée": result["simulated_path"],
+                            "Modèle": result["model_used"]
+                        })
+
+                        if result.get("median_predictions"):
+                            forecast_df["Prévision_médiane"] = result["median_predictions"]
+
+                        all_forecasts.append(forecast_df)
+                        status_text.text(f"✅ [{idx+1}/{len(selected_articles)}] {article} - Succès")
+
                     else:
-                        last_idx = series_data.index[-1]
-                        future_index = np.arange(last_idx + 1, last_idx + 1 + horizon_batch_val)
+                        error_msg = result.get('error', 'Erreur inconnue') if result else 'Pas de réponse'
+                        st.warning(f"⚠️ Échec pour {article}: {error_msg}")
+                        failed_articles.append((article, error_msg))
 
-                    # Créer DataFrame prévision
-                    forecast_df = pd.DataFrame({
-                        "Article": article,
-                        "Date": future_index,
-                        "Prévision_moyenne": result["predictions"],
-                        "IC_95_bas": result["lower_bound"],
-                        "IC_95_haut": result["upper_bound"],
-                        "Trajectoire_simulée": result["simulated_path"],
-                        "Modèle": result["model_used"]
-                    })
-
-                    if result.get("median_predictions"):
-                        forecast_df["Prévision_médiane"] = result["median_predictions"]
-
-                    all_forecasts.append(forecast_df)
-
-                else:
-                    st.warning(f"⚠️ Échec pour {article}: {result.get('error', 'Erreur inconnue')}")
+                except Exception as e:
+                    st.error(f"❌ Erreur lors du traitement de {article}: {str(e)}")
+                    failed_articles.append((article, str(e)))
+                    logger.exception(f"Batch error for {article}")
 
                 progress_bar.progress((idx + 1) / len(selected_articles))
 
             # Stocker all_forecasts dans session_state
             st.session_state.all_forecasts = all_forecasts
 
-            status_text.text("✅ Batch terminé !")
-            st.success(f"✅ Prévisions générées pour {len(all_forecasts)}/{len(selected_articles)} article(s)")
+            # Message de fin détaillé
+            progress_bar.progress(1.0)
+            status_text.empty()
+
+            if success_count == len(selected_articles):
+                st.success(f"🎉 Batch terminé avec succès ! {success_count}/{len(selected_articles)} articles traités")
+            elif success_count > 0:
+                st.warning(f"⚠️ Batch terminé partiellement : {success_count}/{len(selected_articles)} articles réussis")
+            else:
+                st.error(f"❌ Échec total : aucun article n'a pu être traité")
+
+            # Afficher les articles échoués si présents
+            if failed_articles:
+                with st.expander(f"❌ Articles échoués ({len(failed_articles)})"):
+                    for art, reason in failed_articles:
+                        st.text(f"• {art}: {reason}")
 
         # Afficher depuis session_state si disponible
         if 'all_forecasts' in st.session_state and len(st.session_state.all_forecasts) > 0:
             all_forecasts = st.session_state.all_forecasts
             freq_batch_val = st.session_state.batch_config['freq']
             horizon_batch_val = st.session_state.batch_config['horizon']
+            future_index_batch = st.session_state.batch_config.get('future_index', [])
 
             if True:  # Always display if we have results
                 st.subheader("📊 Résumé des prévisions")
@@ -741,7 +913,8 @@ if uploaded_file is not None:
                     viz_result = st.session_state.batch_results[selected_viz_article]
 
                     # Récupérer les données historiques de cet article
-                    df_agg_viz = aggregate_quantities(df_daily, freq=freq_batch_val)
+                    df_agg_viz_wo_bd = aggregate_quantities(df_daily, freq=freq_batch_val)
+                    df_agg_viz = keep_business_day(df_agg_viz_wo_bd)
                     df_art_viz = df_agg_viz[df_agg_viz["Description article"] == selected_viz_article].copy()
                     df_art_viz = df_art_viz.sort_values("Période")
 
@@ -754,16 +927,8 @@ if uploaded_file is not None:
 
                     series_viz = df_art_viz.set_index("Période")["Quantité_totale"]
 
-                    # Construction future index
-                    if isinstance(series_viz.index, pd.DatetimeIndex):
-                        inferred_freq_viz = pd.infer_freq(series_viz.index)
-                        if inferred_freq_viz is None:
-                            inferred_freq_viz = "D"
-                        start_future_viz = series_viz.index[-1] + pd.tseries.frequencies.to_offset(inferred_freq_viz)
-                        future_index_viz = pd.date_range(start=start_future_viz, periods=horizon_batch_val, freq=inferred_freq_viz)
-                    else:
-                        last_idx_viz = series_viz.index[-1]
-                        future_index_viz = np.arange(last_idx_viz + 1, last_idx_viz + 1 + horizon_batch_val)
+                    # Utiliser les jours ouvrés français stockés
+                    future_index_viz = future_index_batch
 
                     # Créer graphique
                     fig_viz = go.Figure()
@@ -946,6 +1111,8 @@ if uploaded_file is not None:
 
         elif run_batch and len(selected_articles) == 0:
             st.warning("⚠️ Veuillez sélectionner au moins un article.")
+        elif run_batch and horizon_batch_val == 0:
+            st.warning("⚠️ Aucun jour ouvré dans la période de forecast. Veuillez sélectionner une période valide.")
 
     # ========================================
     # TAB 3 : VALIDATION HISTORIQUE (BACKTESTING)
@@ -992,20 +1159,19 @@ if uploaded_file is not None:
         # Fréquence
         freq_label_val = st.radio(
             "📅 Fréquence d'agrégation :",
-            ("Jour", "Semaine", "Mois"),
+            ("Jour", "Semaine (Ne pas utiliser)"),
             horizontal=True,
             key="freq_validation"
         )
 
         if freq_label_val == "Jour":
             freq_val = "D"
-        elif freq_label_val == "Semaine":
-            freq_val = "W-MON"
         else:
-            freq_val = "M"
+            freq_val = "W-MON"
 
-        # Obtenir les dates globales pour tous les articles sélectionnés
-        df_agg_val = aggregate_quantities(df_daily, freq=freq_val)
+        # Obtenir les dates globales pour tous les articles sélectionnés avec filtrage business days
+        df_agg_val_wo_bd = aggregate_quantities(df_daily, freq=freq_val)
+        df_agg_val = keep_business_day(df_agg_val_wo_bd)
         df_selected_val = df_agg_val[df_agg_val["Description article"].isin(selected_articles_val)].copy()
 
         if df_selected_val.empty:
